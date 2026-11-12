@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import base64
+import zipfile
 import subprocess
 import urllib.request
 import runpod
@@ -47,11 +48,7 @@ elif not bpy.data.filepath:
 
 scene = bpy.context.scene
 
-# 2. Frame Timeline Selection
-if "frame" in params and params["frame"] is not None:
-    scene.frame_set(int(params["frame"]))
-
-# 3. 32-bit HDRI Environment Setup
+# 2. 32-bit HDRI Environment Setup
 hdri_file = params.get("hdri_file")
 if hdri_file and os.path.exists(hdri_file):
     if not scene.world:
@@ -80,7 +77,7 @@ if hdri_file and os.path.exists(hdri_file):
     links.new(node_env.outputs["Color"], node_bg.inputs["Color"])
     links.new(node_bg.outputs["Background"], node_out.inputs["Surface"])
 
-# 4. Volumetric Atmosphere
+# 3. Volumetric Atmosphere
 vol_config = params.get("volumetrics")
 if vol_config:
     density = float(vol_config.get("density", 0.005))
@@ -96,7 +93,7 @@ if vol_config:
     node_vol.inputs["Anisotropy"].default_value = anisotropy
     links.new(node_vol.outputs["Volume"], node_out.inputs["Volume"])
 
-# 5. Camera Optics and Depth of Field
+# 4. Camera Optics and Depth of Field
 cam_config = params.get("camera")
 cam_obj = scene.camera
 if not cam_obj:
@@ -125,7 +122,7 @@ if cam_config:
         if "focus_distance" in cam_config:
             cam_data.dof.focus_distance = float(cam_config["focus_distance"])
 
-# 6. Auto-Bevel Sharp Edges
+# 5. Auto-Bevel Sharp Edges
 if params.get("auto_bevel", False):
     for obj in scene.objects:
         if obj.type == "MESH" and not obj.modifiers.get("AutoBevel"):
@@ -135,12 +132,12 @@ if params.get("auto_bevel", False):
             bev.limit_method = "ANGLE"
             bev.angle_limit = math.radians(35)
 
-# 7. Procedural Python Override
+# 6. Procedural Python Scene Script
 custom_script = params.get("script")
 if custom_script:
     exec(custom_script, {"bpy": bpy, "math": math, "Vector": Vector, "scene": scene})
 
-# 8. Render Engine and Cycles Device
+# 7. Render Engine and Cycles Device
 scene.render.engine = "CYCLES"
 prefs = bpy.context.preferences.addons["cycles"].preferences
 chosen_device = None
@@ -168,15 +165,25 @@ scene.cycles.use_denoising = True
 scene.cycles.samples = int(params.get("samples", 64))
 scene.view_settings.view_transform = params.get("view_transform", "AgX")
 scene.view_settings.look = params.get("look", "None")
-
 scene.render.resolution_x = int(params.get("width", 1280))
 scene.render.resolution_y = int(params.get("height", 720))
 scene.render.resolution_percentage = 100
-scene.render.filepath = "/tmp/output.png"
 scene.render.image_settings.file_format = "PNG"
 
 print("DEVICE_USED:", chosen_device)
-bpy.ops.render.render(write_still=True)
+
+# 8. Multi-Frame Chunk Execution
+start_f = int(params.get("start_frame", params.get("frame", 1)))
+end_f = int(params.get("end_frame", start_f))
+frames_dir = "/tmp/frames"
+os.makedirs(frames_dir, exist_ok=True)
+
+print(f"RENDERING_FRAMES: {start_f} to {end_f}")
+for f_num in range(start_f, end_f + 1):
+    scene.frame_set(f_num)
+    scene.render.filepath = f"{frames_dir}/frame_{f_num:04d}.png"
+    bpy.ops.render.render(write_still=True)
+    print(f"FRAME_COMPLETE: {f_num}")
 '''
 
 
@@ -188,13 +195,19 @@ def download_file(url, target_path):
 
 def handler(job):
     inp = job.get("input", {})
+    start_f = int(inp.get("start_frame", inp.get("frame", 1)))
+    end_f = int(inp.get("end_frame", start_f))
+    output_format = inp.get("output_format", "mp4" if end_f > start_f else "png").lower()
+    fps = int(inp.get("fps", 24))
+
     params = {
         "samples": int(inp.get("samples", 64)),
         "width": int(inp.get("width", 1280)),
         "height": int(inp.get("height", 720)),
         "view_transform": inp.get("view_transform", "AgX"),
         "look": inp.get("look", "None"),
-        "frame": inp.get("frame"),
+        "start_frame": start_f,
+        "end_frame": end_f,
         "camera": inp.get("camera"),
         "volumetrics": inp.get("volumetrics"),
         "auto_bevel": bool(inp.get("auto_bevel", False)),
@@ -203,13 +216,9 @@ def handler(job):
         "hdri_rotation": inp.get("hdri_rotation", 0.0),
     }
 
-    out_path = "/tmp/output.png"
-    for p in (out_path, "/tmp/scene_input", "/tmp/environment.exr", "/tmp/params.json", "/tmp/run_render.py"):
-        if os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+    frames_dir = "/tmp/frames"
+    subprocess.run(["rm", "-rf", frames_dir, "/tmp/output.mp4", "/tmp/frames.zip"], check=False)
+    os.makedirs(frames_dir, exist_ok=True)
 
     scene_url = inp.get("scene_url") or inp.get("blend_url")
     if scene_url:
@@ -242,23 +251,76 @@ def handler(job):
 
     cmd = ["blender", "-b", "-P", "/tmp/run_render.py"]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    log_tail = result.stdout[-2000:]
+    log_tail = result.stdout[-2500:]
 
-    if result.returncode != 0 or not os.path.exists(out_path):
+    rendered_files = sorted([
+        os.path.join(frames_dir, f) for f in os.listdir(frames_dir) if f.endswith(".png")
+    ])
+
+    if result.returncode != 0 or not rendered_files:
         return {
             "error": "Render execution failed",
             "log": log_tail,
-            "stderr": result.stderr[-2000:]
+            "stderr": result.stderr[-2500:]
         }
 
     device_line = [line for line in result.stdout.splitlines() if "DEVICE_USED" in line]
-    with open(out_path, "rb") as img:
-        encoded = base64.b64encode(img.read()).decode("utf-8")
+    device_str = device_line[-1] if device_line else "unknown"
+
+    # Case 1: Single Frame
+    if len(rendered_files) == 1 and end_f == start_f:
+        with open(rendered_files[0], "rb") as img:
+            encoded = base64.b64encode(img.read()).decode("utf-8")
+        return {
+            "status": "success",
+            "device": device_str,
+            "frames_count": 1,
+            "image_base64": encoded
+        }
+
+    # Case 2: Multi-Frame Chunk as MP4
+    if output_format == "mp4":
+        mp4_path = "/tmp/output.mp4"
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(fps),
+            "-start_number", str(start_f),
+            "-i", f"{frames_dir}/frame_%04d.png",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "17",
+            "-preset", "fast",
+            mp4_path
+        ]
+        enc_res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+        if enc_res.returncode == 0 and os.path.exists(mp4_path):
+            with open(mp4_path, "rb") as vid:
+                encoded_vid = base64.b64encode(vid.read()).decode("utf-8")
+            return {
+                "status": "success",
+                "device": device_str,
+                "start_frame": start_f,
+                "end_frame": end_f,
+                "frames_count": len(rendered_files),
+                "video_base64": encoded_vid
+            }
+
+    # Case 3: Multi-Frame Chunk as ZIP of PNGs
+    zip_path = "/tmp/frames.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for f_path in rendered_files:
+            zipf.write(f_path, arcname=os.path.basename(f_path))
+
+    with open(zip_path, "rb") as zf:
+        encoded_zip = base64.b64encode(zf.read()).decode("utf-8")
 
     return {
         "status": "success",
-        "device": device_line[-1] if device_line else "unknown",
-        "image_base64": encoded
+        "device": device_str,
+        "start_frame": start_f,
+        "end_frame": end_f,
+        "frames_count": len(rendered_files),
+        "zip_base64": encoded_zip
     }
 
 
